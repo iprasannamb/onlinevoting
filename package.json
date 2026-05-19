@@ -1,0 +1,19 @@
+{
+  "name": "secure_voting_system",
+  "version": "1.0.0",
+  "description": "A comprehensive, secure, and transparent digital voting platform built with Flask, featuring role-based authentication, blockchain simulation, and real-time results visualization.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "body-parser": "^2.2.2",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "mysql2": "^3.22.3"
+  }
+}
