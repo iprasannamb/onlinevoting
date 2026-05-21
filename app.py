@@ -11,9 +11,14 @@ import re
 from datetime import datetime, timedelta
 from functools import wraps
 from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify
+from flask_cors import CORS
 
 app = Flask(__name__)
 app.secret_key = 'your-secret-key-change-in-production'
+app.config.update(
+    SESSION_COOKIE_SAMESITE="Lax",
+)
+CORS(app, supports_credentials=True, origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:3000", "http://127.0.0.1:3000"])
 # Session configuration
 app.permanent_session_lifetime = timedelta(hours=1)
 
@@ -957,6 +962,717 @@ def logout():
     session.clear()
     flash('Logged out successfully!', 'success')
     return redirect(url_for('login'))
+
+# ==========================================
+# REST API Endpoints for React Frontend
+# ==========================================
+
+@app.route('/api/session', methods=['GET'])
+def api_session():
+    if 'user_type' in session:
+        user_data = {
+            'user_type': session['user_type'],
+            'username': session.get('username'),
+            'voter_id': session.get('voter_id'),
+            'voter_name': session.get('voter_name'),
+            'assembly_id': session.get('assembly_id'),
+            'assembly_name': session.get('assembly_name')
+        }
+        return jsonify({'logged_in': True, 'user': user_data})
+    return jsonify({'logged_in': False})
+
+@app.route('/api/register_voter', methods=['POST'])
+def api_register_voter():
+    data = request.json or {}
+    voter_id = data.get('voter_id')
+    name = data.get('name')
+    age = data.get('age')
+    gender = data.get('gender') or None
+    assembly_id = data.get('constituency_id')
+    mobile = data.get('mobile') or None
+
+    if not voter_id or not re.fullmatch(r'^RSB\d{7}$', voter_id):
+        return jsonify({'error': 'Invalid Voter ID Format (must be RSB followed by 7 digits)'}), 400
+    
+    if not name or not age or not assembly_id:
+        return jsonify({'error': 'Name, age, and constituency are required'}), 400
+
+    try:
+        age = int(age)
+        if age < 18:
+            return jsonify({'error': 'Voter must be 18 years or older'}), 400
+    except ValueError:
+        return jsonify({'error': 'Age must be a number'}), 400
+
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('''
+            INSERT INTO voters (voter_id, full_name, age, gender, assembly_id, mobile, approval_status, verified_status)
+            VALUES (?, ?, ?, ?, ?, ?, 'Pending', 0)
+        ''', (voter_id, name, age, gender, assembly_id, mobile))
+        conn.commit()
+        return jsonify({'success': True, 'message': 'Voter registration successful! Wait for admin approval.'})
+    except sqlite3.IntegrityError:
+        return jsonify({'error': 'Voter ID already exists!'}), 400
+    finally:
+        conn.close()
+
+@app.route('/api/login', methods=['POST'])
+def api_login():
+    data = request.json or {}
+    user_type = data.get('user_type')
+    
+    if user_type == 'admin':
+        username = data.get('username')
+        password = data.get('password')
+        
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM admin WHERE username = ?', (username,))
+        admin = cursor.fetchone()
+        conn.close()
+        
+        if admin and admin['password'] == hashlib.sha256(password.encode()).hexdigest():
+            session.permanent = True
+            session['user_type'] = 'admin'
+            session['username'] = username
+            return jsonify({
+                'success': True,
+                'user': {
+                    'user_type': 'admin',
+                    'username': username
+                }
+            })
+        else:
+            return jsonify({'error': 'Invalid admin credentials!'}), 401
+    
+    elif user_type == 'voter':
+        voter_id = data.get('voter_id')
+        full_name = data.get('full_name') or ''
+        
+        if not voter_id or not re.fullmatch(r'^RSB\d{7}$', voter_id):
+            return jsonify({'error': 'Invalid Voter ID Format (must be RSB followed by 7 digits)'}), 400
+            
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT v.*, a.name as assembly_name
+            FROM voters v
+            JOIN assemblies a ON v.assembly_id = a.assembly_id
+            WHERE v.voter_id = ?
+        ''', (voter_id,))
+        voter = cursor.fetchone()
+        conn.close()
+        
+        if voter:
+            if full_name.strip() and full_name.strip().lower() != (voter['full_name'] or '').lower():
+                return jsonify({'error': 'Voter name does not match our records.'}), 400
+                
+            if (voter['approval_status'] or '').lower() != 'approved' or not voter['verified_status']:
+                return jsonify({'error': 'Voter not approved/verified yet! Please wait for admin approval.'}), 403
+                
+            session.permanent = True
+            session['user_type'] = 'voter'
+            session['voter_id'] = voter['voter_id']
+            session['voter_name'] = voter['full_name']
+            session['assembly_id'] = voter['assembly_id']
+            session['assembly_name'] = voter['assembly_name']
+            return jsonify({
+                'success': True,
+                'user': {
+                    'user_type': 'voter',
+                    'voter_id': voter['voter_id'],
+                    'voter_name': voter['full_name'],
+                    'assembly_id': voter['assembly_id'],
+                    'assembly_name': voter['assembly_name']
+                }
+            })
+        else:
+            return jsonify({'error': 'Invalid Voter ID!'}), 401
+            
+    return jsonify({'error': 'Invalid user type!'}), 400
+
+@app.route('/api/logout', methods=['POST'])
+def api_logout():
+    session.clear()
+    return jsonify({'success': True, 'message': 'Logged out successfully!'})
+
+@app.route('/api/assemblies', methods=['GET'])
+def api_assemblies():
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM assemblies ORDER BY name')
+    assemblies = cursor.fetchall()
+    conn.close()
+    return jsonify({'assemblies': [dict(row) for row in assemblies]})
+
+@app.route('/api/voter/dashboard', methods=['GET'])
+def api_voter_dashboard():
+    if 'user_type' not in session or session['user_type'] != 'voter':
+        return jsonify({'error': 'Voter login required'}), 401
+        
+    voter_id = session['voter_id']
+    assembly_id = session['assembly_id']
+    
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT has_voted FROM voters WHERE voter_id = ?', (voter_id,))
+    has_voted = cursor.fetchone()['has_voted']
+    
+    cursor.execute('SELECT status, election_type, result_declared FROM election WHERE id = 1')
+    election = cursor.fetchone()
+    
+    cursor.execute('SELECT * FROM candidates WHERE verified_by_eci = 1 AND assembly_id = ?', (assembly_id,))
+    candidates = cursor.fetchall()
+    
+    cursor.execute('SELECT * FROM assemblies WHERE assembly_id = ?', (assembly_id,))
+    assembly = cursor.fetchone()
+    
+    # Get blockchain audit chain
+    cursor.execute('SELECT * FROM blockchain ORDER BY block_id ASC')
+    blocks_data = cursor.fetchall()
+    blockchain_list = []
+    for row in blocks_data:
+        try:
+            blockchain_list.append(json.loads(row['block_data']))
+        except Exception:
+            pass
+            
+    conn.close()
+    
+    return jsonify({
+        'voter': {
+            'voter_id': voter_id,
+            'full_name': session['voter_name'],
+            'assembly_id': assembly_id,
+            'assembly_name': session['assembly_name']
+        },
+        'has_voted': bool(has_voted),
+        'election': dict(election),
+        'candidates': [dict(c) for c in candidates],
+        'assembly': dict(assembly),
+        'blockchain': blockchain_list
+    })
+
+@app.route('/api/vote', methods=['POST'])
+def api_vote():
+    if 'user_type' not in session or session['user_type'] != 'voter':
+        return jsonify({'error': 'Voter login required'}), 401
+        
+    data = request.json or {}
+    candidate_id = data.get('candidate_id')
+    voter_id = session['voter_id']
+    assembly_id = session['assembly_id']
+    
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    # Check if voter has already voted
+    cursor.execute('SELECT has_voted FROM voters WHERE voter_id = ?', (voter_id,))
+    has_voted = cursor.fetchone()['has_voted']
+    
+    if has_voted:
+        conn.close()
+        return jsonify({'error': 'You have already voted!'}), 400
+        
+    # Check election status
+    cursor.execute('SELECT status FROM election WHERE id = 1')
+    election_status = cursor.fetchone()['status']
+    
+    if election_status != 'started':
+        conn.close()
+        return jsonify({'error': 'Election is not active!'}), 400
+        
+    # Verify candidate belongs to voter's constituency
+    cursor.execute('SELECT * FROM candidates WHERE candidate_id = ? AND assembly_id = ? AND verified_by_eci = 1', 
+                  (candidate_id, assembly_id))
+    candidate = cursor.fetchone()
+    
+    if not candidate:
+        conn.close()
+        return jsonify({'error': 'Invalid candidate for your constituency!'}), 400
+        
+    try:
+        vote_data = f"{voter_id}_{candidate_id}_{assembly_id}_{datetime.now()}"
+        encrypted_vote = hashlib.sha256(vote_data.encode()).hexdigest()
+        
+        cursor.execute('''
+            INSERT INTO votes (voter_id, candidate_id, assembly_id, encrypted_vote)
+            VALUES (?, ?, ?, ?)
+        ''', (voter_id, candidate_id, assembly_id, encrypted_vote))
+        
+        cursor.execute('UPDATE candidates SET votes_count = votes_count + 1 WHERE candidate_id = ?', (candidate_id,))
+        cursor.execute('UPDATE voters SET has_voted = 1 WHERE voter_id = ?', (voter_id,))
+        
+        # Add to blockchain
+        previous_hash = blockchain.chain[-1]['hash'] if blockchain.chain else '0'
+        blockchain.create_block(voter_id, candidate_id, previous_hash)
+        
+        block_data = json.dumps(blockchain.chain[-1])
+        cursor.execute('INSERT INTO blockchain (block_data) VALUES (?)', (block_data,))
+        
+        conn.commit()
+        return jsonify({'success': True, 'message': 'Vote cast successfully!'})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'error': 'Error casting vote!'}), 500
+    finally:
+        conn.close()
+
+@app.route('/api/admin/dashboard', methods=['GET'])
+def api_admin_dashboard():
+    if 'user_type' not in session or session['user_type'] != 'admin':
+        return jsonify({'error': 'Admin login required'}), 401
+        
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT COUNT(*) as count FROM voters WHERE LOWER(approval_status) = 'approved'")
+    total_voters = cursor.fetchone()['count']
+    
+    cursor.execute('SELECT COUNT(*) as count FROM votes')
+    total_votes = cursor.fetchone()['count']
+    
+    cursor.execute('SELECT COUNT(*) as count FROM assemblies')
+    total_constituencies = cursor.fetchone()['count']
+    
+    cursor.execute('SELECT c.*, a.name as constituency_name FROM candidates c JOIN assemblies a ON c.assembly_id = a.assembly_id')
+    candidates = cursor.fetchall()
+    
+    cursor.execute("SELECT v.*, a.name as constituency_name FROM voters v JOIN assemblies a ON v.assembly_id = a.assembly_id WHERE LOWER(v.approval_status) = 'pending'")
+    pending_voters = cursor.fetchall()
+    
+    cursor.execute('SELECT * FROM election WHERE id = 1')
+    election = cursor.fetchone()
+    
+    cursor.execute('SELECT * FROM government WHERE id = 1')
+    government = cursor.fetchone()
+    
+    seat_distribution = []
+    if election['result_declared']:
+        cursor.execute('''
+            SELECT c.party_name as party, COUNT(*) as seats_won
+            FROM results r
+            JOIN candidates c ON r.candidate_id = c.candidate_id
+            WHERE r.position = 1
+            GROUP BY c.party_name
+            ORDER BY seats_won DESC
+        ''')
+        seat_distribution = cursor.fetchall()
+        
+    conn.close()
+    
+    return jsonify({
+        'total_voters': total_voters,
+        'total_votes': total_votes,
+        'total_constituencies': total_constituencies,
+        'candidates': [dict(c) for c in candidates],
+        'pending_voters': [dict(v) for v in pending_voters],
+        'election': dict(election),
+        'government': dict(government) if government else None,
+        'seat_distribution': [dict(s) for s in seat_distribution]
+    })
+
+@app.route('/api/admin/add_candidate', methods=['POST'])
+def api_admin_add_candidate():
+    if 'user_type' not in session or session['user_type'] != 'admin':
+        return jsonify({'error': 'Admin login required'}), 401
+        
+    data = request.json or {}
+    name = data.get('name')
+    party = data.get('party')
+    assembly_id = data.get('constituency_id')
+    symbol = data.get('symbol') or (PARTY_SYMBOLS.get(party) or random.choice(DEFAULT_SYMBOLS))
+    serial_no = data.get('candidate_serial_no')
+    verified = 1 if str(data.get('verified')).lower() in ('1', 'true', 'yes') else 1
+    
+    if not name or not party or not assembly_id:
+        return jsonify({'error': 'Name, party, and constituency are required'}), 400
+        
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        if not serial_no:
+            cursor.execute('SELECT COALESCE(MAX(candidate_serial_no), 0) as maxsn FROM candidates')
+            serial_no = cursor.fetchone()['maxsn'] + 1
+            
+        cursor.execute('''
+            INSERT INTO candidates (candidate_serial_no, candidate_name, party_name, assembly_id, symbol, verified_by_eci, votes_count)
+            VALUES (?, ?, ?, ?, ?, ?, 0)
+        ''', (serial_no, name, party, assembly_id, symbol, verified))
+        conn.commit()
+        return jsonify({'success': True, 'message': 'Candidate added successfully!'})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'error': 'Error adding candidate'}), 500
+    finally:
+        conn.close()
+
+@app.route('/api/admin/edit_candidate/<int:candidate_id>', methods=['POST'])
+def api_admin_edit_candidate(candidate_id):
+    if 'user_type' not in session or session['user_type'] != 'admin':
+        return jsonify({'error': 'Admin login required'}), 401
+        
+    data = request.json or {}
+    name = data.get('name')
+    party = data.get('party')
+    assembly_id = data.get('constituency_id')
+    symbol = data.get('symbol')
+    verified = 1 if str(data.get('verified')).lower() in ('1', 'true', 'yes') else 0
+    serial_no = data.get('candidate_serial_no')
+    
+    if not name or not party or not assembly_id:
+        return jsonify({'error': 'Name, party, and constituency are required'}), 400
+        
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('''
+            UPDATE candidates SET candidate_name = ?, party_name = ?, assembly_id = ?, symbol = ?, verified_by_eci = ?, candidate_serial_no = ?
+            WHERE candidate_id = ?
+        ''', (name, party, assembly_id, symbol, verified, serial_no, candidate_id))
+        conn.commit()
+        return jsonify({'success': True, 'message': 'Candidate updated successfully!'})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'error': 'Error updating candidate'}), 500
+    finally:
+        conn.close()
+
+@app.route('/api/admin/delete_candidate/<int:candidate_id>', methods=['DELETE'])
+def api_admin_delete_candidate(candidate_id):
+    if 'user_type' not in session or session['user_type'] != 'admin':
+        return jsonify({'error': 'Admin login required'}), 401
+        
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('DELETE FROM candidates WHERE candidate_id = ?', (candidate_id,))
+        conn.commit()
+        return jsonify({'success': True, 'message': 'Candidate removed successfully!'})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'error': 'Error removing candidate'}), 500
+    finally:
+        conn.close()
+
+@app.route('/api/admin/approve_candidate/<int:candidate_id>', methods=['POST'])
+def api_admin_approve_candidate(candidate_id):
+    if 'user_type' not in session or session['user_type'] != 'admin':
+        return jsonify({'error': 'Admin login required'}), 401
+        
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('UPDATE candidates SET verified_by_eci = 1 WHERE candidate_id = ?', (candidate_id,))
+        conn.commit()
+        return jsonify({'success': True, 'message': 'Candidate approved!'})
+    except Exception:
+        conn.rollback()
+        return jsonify({'error': 'Error approving candidate'}), 500
+    finally:
+        conn.close()
+
+@app.route('/api/admin/reject_candidate/<int:candidate_id>', methods=['POST'])
+def api_admin_reject_candidate(candidate_id):
+    if 'user_type' not in session or session['user_type'] != 'admin':
+        return jsonify({'error': 'Admin login required'}), 401
+        
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('UPDATE candidates SET verified_by_eci = 0 WHERE candidate_id = ?', (candidate_id,))
+        conn.commit()
+        return jsonify({'success': True, 'message': 'Candidate rejected!'})
+    except Exception:
+        conn.rollback()
+        return jsonify({'error': 'Error rejecting candidate'}), 500
+    finally:
+        conn.close()
+
+@app.route('/api/admin/approve_voter/<voter_id>', methods=['POST'])
+def api_admin_approve_voter(voter_id):
+    if 'user_type' not in session or session['user_type'] != 'admin':
+        return jsonify({'error': 'Admin login required'}), 401
+        
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("UPDATE voters SET approval_status = 'Approved', verified_status = 1 WHERE voter_id = ?", (voter_id,))
+        conn.commit()
+        return jsonify({'success': True, 'message': 'Voter approved!'})
+    except Exception:
+        conn.rollback()
+        return jsonify({'error': 'Error approving voter'}), 500
+    finally:
+        conn.close()
+
+@app.route('/api/admin/reject_voter/<voter_id>', methods=['POST'])
+def api_admin_reject_voter(voter_id):
+    if 'user_type' not in session or session['user_type'] != 'admin':
+        return jsonify({'error': 'Admin login required'}), 401
+        
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("UPDATE voters SET approval_status = 'Rejected', verified_status = 0 WHERE voter_id = ?", (voter_id,))
+        conn.commit()
+        return jsonify({'success': True, 'message': 'Voter rejected!'})
+    except Exception:
+        conn.rollback()
+        return jsonify({'error': 'Error rejecting voter'}), 500
+    finally:
+        conn.close()
+
+@app.route('/api/admin/election/start', methods=['POST'])
+def api_admin_election_start():
+    if 'user_type' not in session or session['user_type'] != 'admin':
+        return jsonify({'error': 'Admin login required'}), 401
+        
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('UPDATE election SET status = "started" WHERE id = 1')
+        conn.commit()
+        return jsonify({'success': True, 'message': 'Election started!'})
+    except Exception:
+        conn.rollback()
+        return jsonify({'error': 'Error starting election'}), 500
+    finally:
+        conn.close()
+
+@app.route('/api/admin/election/pause', methods=['POST'])
+def api_admin_election_pause():
+    if 'user_type' not in session or session['user_type'] != 'admin':
+        return jsonify({'error': 'Admin login required'}), 401
+        
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('UPDATE election SET status = "paused" WHERE id = 1')
+        conn.commit()
+        return jsonify({'success': True, 'message': 'Election paused!'})
+    except Exception:
+        conn.rollback()
+        return jsonify({'error': 'Error pausing election'}), 500
+    finally:
+        conn.close()
+
+@app.route('/api/admin/election/end', methods=['POST'])
+def api_admin_election_end():
+    if 'user_type' not in session or session['user_type'] != 'admin':
+        return jsonify({'error': 'Admin login required'}), 401
+        
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('UPDATE election SET status = "ended" WHERE id = 1')
+        conn.commit()
+        return jsonify({'success': True, 'message': 'Election ended!'})
+    except Exception:
+        conn.rollback()
+        return jsonify({'error': 'Error ending election'}), 500
+    finally:
+        conn.close()
+
+@app.route('/api/admin/election/declare_results', methods=['POST'])
+def api_admin_election_declare_results():
+    if 'user_type' not in session or session['user_type'] != 'admin':
+        return jsonify({'error': 'Admin login required'}), 401
+        
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('UPDATE election SET result_declared = 1 WHERE id = 1')
+        conn.commit()
+        return jsonify({'success': True, 'message': 'Results declared!'})
+    except Exception:
+        conn.rollback()
+        return jsonify({'error': 'Error declaring results'}), 500
+    finally:
+        conn.close()
+
+@app.route('/api/admin/election/calculate_results', methods=['POST'])
+def api_admin_election_calculate_results():
+    if 'user_type' not in session or session['user_type'] != 'admin':
+        return jsonify({'error': 'Admin login required'}), 401
+        
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    try:
+        # Get all assemblies
+        cursor.execute('SELECT * FROM assemblies')
+        constituencies = cursor.fetchall()
+        
+        # Clear existing results
+        cursor.execute('DELETE FROM results')
+        
+        # Calculate results for each constituency
+        for constituency in constituencies:
+            assembly_id = constituency['assembly_id']
+            
+            cursor.execute('''
+                SELECT c.candidate_id, c.candidate_name as name, c.party_name as party, COALESCE(c.votes_count, 0) as votes
+                FROM candidates c
+                WHERE c.assembly_id = ? AND c.verified_by_eci = 1
+                ORDER BY votes DESC
+            ''', (assembly_id,))
+            
+            candidates_results = cursor.fetchall()
+            
+            for position, candidate in enumerate(candidates_results, 1):
+                cursor.execute('''
+                    INSERT INTO results (assembly_id, candidate_id, votes, position, declared)
+                    VALUES (?, ?, ?, ?, 1)
+                ''', (assembly_id, candidate['candidate_id'], candidate['votes'], position))
+        
+        # Calculate party-wise seat distribution
+        cursor.execute('''
+            SELECT c.party_name as party, COUNT(*) as seats_won
+            FROM results r
+            JOIN candidates c ON r.candidate_id = c.candidate_id
+            WHERE r.position = 1
+            GROUP BY c.party_name
+            ORDER BY seats_won DESC
+        ''')
+        
+        party_seats = cursor.fetchall()
+        
+        winning_party = None
+        majority_obtained = False
+        chief_minister = None
+        
+        if party_seats:
+            winning_party = party_seats[0]['party']
+            seats_won = party_seats[0]['seats_won']
+            
+            if seats_won >= MAJORITY_SEATS:
+                majority_obtained = True
+                chief_minister = "To be announced"
+        
+        # Update government table
+        cursor.execute('''
+            UPDATE government 
+            SET winning_party = ?, seats_won = ?, majority_obtained = ?, 
+                chief_minister = ?, government_formed = ?
+            WHERE id = 1
+        ''', (winning_party, party_seats[0]['seats_won'] if party_seats else 0, 
+              majority_obtained, chief_minister, majority_obtained))
+        
+        conn.commit()
+        return jsonify({'success': True, 'message': 'Results calculated successfully!'})
+        
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'error': 'Error calculating results!'}), 500
+    finally:
+        conn.close()
+
+@app.route('/api/admin/assign_cm', methods=['POST'])
+def api_admin_assign_cm():
+    if 'user_type' not in session or session['user_type'] != 'admin':
+        return jsonify({'error': 'Admin login required'}), 401
+        
+    data = request.json or {}
+    cm_name = data.get('cm_name')
+    
+    if not cm_name:
+        return jsonify({'error': 'CM name is required'}), 400
+        
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('UPDATE government SET chief_minister = ? WHERE id = 1', (cm_name,))
+        conn.commit()
+        return jsonify({'success': True, 'message': 'Chief Minister assigned successfully!'})
+    except Exception:
+        conn.rollback()
+        return jsonify({'error': 'Error assigning Chief Minister'}), 500
+    finally:
+        conn.close()
+
+@app.route('/api/public_results', methods=['GET'])
+def api_public_results():
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute('SELECT assembly_id, name FROM assemblies ORDER BY name')
+    assemblies = cursor.fetchall()
+    
+    cursor.execute('SELECT result_declared, status, election_type FROM election WHERE id = 1')
+    election = cursor.fetchone()
+    
+    cursor.execute('SELECT * FROM government WHERE id = 1')
+    government = cursor.fetchone()
+    
+    seat_distribution = []
+    if election['result_declared']:
+        cursor.execute('''
+            SELECT c.party_name as party, COUNT(*) as seats_won
+            FROM results r
+            JOIN candidates c ON r.candidate_id = c.candidate_id
+            WHERE r.position = 1
+            GROUP BY c.party_name
+            ORDER BY seats_won DESC
+        ''')
+        seat_distribution = cursor.fetchall()
+        
+    conn.close()
+    
+    return jsonify({
+        'assemblies': [dict(row) for row in assemblies],
+        'election': dict(election),
+        'government': dict(government) if government else None,
+        'seat_distribution': [dict(s) for s in seat_distribution]
+    })
+
+@app.route('/api/public_results/<int:assembly_id>', methods=['GET'])
+def api_public_results_detail(assembly_id):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute('SELECT result_declared, election_type, status FROM election WHERE id = 1')
+    election = cursor.fetchone()
+    
+    cursor.execute('SELECT * FROM assemblies WHERE assembly_id = ?', (assembly_id,))
+    assembly = cursor.fetchone()
+
+    if not assembly:
+        conn.close()
+        return jsonify({'error': 'Constituency not found'}), 404
+
+    if not election['result_declared']:
+        conn.close()
+        return jsonify({
+            'assembly': dict(assembly),
+            'election': dict(election),
+            'result_declared': False
+        })
+
+    cursor.execute('''
+        SELECT r.position, r.votes, c.candidate_name, c.party_name, c.symbol
+        FROM results r
+        JOIN candidates c ON r.candidate_id = c.candidate_id
+        WHERE r.assembly_id = ?
+        ORDER BY r.position ASC
+    ''', (assembly_id,))
+    candidates_results = cursor.fetchall()
+
+    cursor.execute('SELECT COUNT(*) as total_votes FROM votes WHERE assembly_id = ?', (assembly_id,))
+    total_votes = cursor.fetchone()['total_votes']
+    total_voters = assembly['total_voters'] or 0
+    turnout_pct = round((total_votes / total_voters) * 100, 2) if total_voters else None
+
+    conn.close()
+    return jsonify({
+        'assembly': dict(assembly),
+        'election': dict(election),
+        'result_declared': True,
+        'results': [dict(r) for r in candidates_results],
+        'total_votes': total_votes,
+        'turnout_pct': turnout_pct
+    })
 
 if __name__ == '__main__':
     init_db()

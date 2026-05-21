@@ -11,40 +11,38 @@ def test_voting_functionality():
         
         # Test admin login
         print("Testing admin login...")
-        response = test_client.post('/authenticate', data={
+        response = test_client.post('/api/login', json={
             'user_type': 'admin',
             'username': 'admin',
             'password': 'admin123'
-        }, follow_redirects=True)
-        print(f"Admin login status: {response.status_code}")
+        })
+        print(f"Admin API login status: {response.status_code}, data: {response.get_data(as_text=True)}")
         
-        # Test voter OTP generation
-        print("\nTesting voter OTP generation...")
-        response = test_client.post('/authenticate', data={
+        # Test voter login
+        print("\nTesting voter API login...")
+        response = test_client.post('/api/login', json={
             'user_type': 'voter',
-            'voter_id': 'VOT001'
-        }, follow_redirects=True)
-        print(f"Voter OTP generation status: {response.status_code}")
+            'voter_id': 'RSB1000001',
+            'full_name': 'Ramesh Rao'
+        })
+        print(f"Voter API login status: {response.status_code}, data: {response.get_data(as_text=True)}")
         
-        # Test candidate registration
-        print("\nTesting candidate registration...")
-        response = test_client.post('/candidate_register_submit', data={
-            'candidate_id': 'TEST001',
-            'name': 'Test Candidate',
-            'party': 'TEST',
-            'password': 'test123'
-        }, follow_redirects=True)
-        print(f"Candidate registration status: {response.status_code}")
+        # Test voter registration API
+        print("\nTesting voter registration API...")
+        response = test_client.post('/api/register_voter', json={
+            'voter_id': 'RSB2000001',
+            'name': 'Suresh Kumar',
+            'age': 25,
+            'gender': 'Male',
+            'constituency_id': 1,
+            'mobile': '9988776655'
+        })
+        print(f"Voter registration status: {response.status_code}, data: {response.get_data(as_text=True)}")
         
-        # Test results API
-        print("\nTesting results API...")
-        with test_client.session_transaction() as sess:
-            sess['user_type'] = 'admin'
-        
-        response = test_client.get('/api/results')
-        print(f"Results API status: {response.status_code}")
-        
-        print("\nFunctionality tests completed!")
+        # Test public results API
+        print("\nTesting public results API...")
+        response = test_client.get('/api/public_results')
+        print(f"Public results status: {response.status_code}")
         
     except Exception as e:
         print(f"Functionality test error: {e}")

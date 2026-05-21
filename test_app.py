@@ -11,11 +11,11 @@ def test_app():
         print("Testing Flask app...")
         test_client = app.app.test_client()
         
-        # Test main routes
+        # Test main API routes
         routes = [
-            '/',
-            '/login',
-            '/candidate_register'
+            '/api/session',
+            '/api/assemblies',
+            '/api/public_results'
         ]
         
         for route in routes:
